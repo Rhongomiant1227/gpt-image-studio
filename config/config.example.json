@@ -1,0 +1,15 @@
+{
+  "active_profile": "openai-compatible",
+  "profiles": [
+    {
+      "name": "openai-compatible",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "",
+      "model": "gpt-image-2"
+    }
+  ],
+  "server": {
+    "host": "127.0.0.1",
+    "port": 7862
+  }
+}

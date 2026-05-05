@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>gpt-image-studio</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark">GI</div>
+          <div>
+            <h1>gpt-image-studio</h1>
+            <p>gpt-image-2 local workspace</p>
+          </div>
+        </div>
+        <div class="top-actions">
+          <span id="statusPill" class="status-pill pending">检查中</span>
+          <select id="profileSelect" class="select compact"></select>
+          <button id="refreshStatusBtn" class="button secondary">测试</button>
+          <button id="settingsBtn" class="button primary">配置</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="panel history-panel">
+          <div class="panel-head">
+            <div>
+              <h2>历史</h2>
+              <p id="historyCount">0 条记录</p>
+            </div>
+            <button id="reloadHistoryBtn" class="button ghost">刷新</button>
+          </div>
+          <input id="historySearch" class="input" placeholder="搜索 prompt" />
+          <div id="historyList" class="history-list"></div>
+        </aside>
+
+        <section class="studio-panel">
+          <div class="composer panel">
+            <div class="composer-head">
+              <div>
+                <h2>创作</h2>
+                <p id="modeHint">文本生成或导入图片后编辑</p>
+              </div>
+              <button id="clearBtn" class="button ghost">清空</button>
+            </div>
+
+            <textarea id="promptInput" class="prompt" spellcheck="false" placeholder="输入画面描述、角色要求、风格约束、避免事项。"></textarea>
+
+            <div class="controls-grid">
+              <label class="field">
+                <span>模式</span>
+                <select id="modeSelect" class="select">
+                  <option value="auto">自动</option>
+                  <option value="generate">文本生成</option>
+                  <option value="edit">图片编辑</option>
+                </select>
+              </label>
+
+              <label class="field">
+                <span>分辨率</span>
+                <select id="sizeSelect" class="select">
+                  <option value="1024x1024">1024 x 1024</option>
+                  <option value="1024x1536" selected>1024 x 1536</option>
+                  <option value="1536x1024">1536 x 1024</option>
+                  <option value="2048x2048">2048 x 2048</option>
+                  <option value="2048x1152">2048 x 1152</option>
+                  <option value="1152x2048">1152 x 2048</option>
+                  <option value="3840x2160">3840 x 2160</option>
+                  <option value="2160x3840">2160 x 3840</option>
+                  <option value="auto">auto</option>
+                  <option value="custom">自定义</option>
+                </select>
+              </label>
+
+              <label class="field custom-size" id="customSizeField">
+                <span>自定义</span>
+                <input id="customSizeInput" class="input" value="1280x1280" />
+              </label>
+
+              <label class="field">
+                <span>质量</span>
+                <select id="qualitySelect" class="select">
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high" selected>high</option>
+                  <option value="auto">auto</option>
+                </select>
+              </label>
+
+              <label class="field">
+                <span>数量</span>
+                <input id="countInput" class="input" type="number" min="1" max="10" value="1" />
+              </label>
+
+              <label class="field">
+                <span>格式</span>
+                <select id="formatSelect" class="select">
+                  <option value="png" selected>png</option>
+                  <option value="jpeg">jpeg</option>
+                  <option value="webp">webp</option>
+                </select>
+              </label>
+            </div>
+
+            <div id="dropZone" class="drop-zone">
+              <input id="fileInput" type="file" accept="image/png,image/jpeg,image/webp" multiple />
+              <div>
+                <strong>导入参考图</strong>
+                <span>拖入图片、Ctrl+V 粘贴，或点击选择文件</span>
+              </div>
+              <button class="button secondary" type="button">选择图片</button>
+            </div>
+
+            <div id="inputStrip" class="input-strip"></div>
+
+            <div class="submit-row">
+              <div id="selectionSummary" class="summary">未选择参考图</div>
+              <button id="generateBtn" class="button generate">生成</button>
+            </div>
+          </div>
+
+          <div class="results panel">
+            <div class="panel-head">
+              <div>
+                <h2>结果</h2>
+                <p id="resultMeta">等待生成</p>
+              </div>
+            </div>
+            <div id="resultGrid" class="result-grid empty">
+              <div class="empty-state">生成结果会出现在这里</div>
+            </div>
+          </div>
+        </section>
+
+        <aside class="panel library-panel">
+          <div class="panel-head">
+            <div>
+              <h2>图片库</h2>
+              <p id="uploadCount">0 张图片</p>
+            </div>
+            <button id="reloadUploadsBtn" class="button ghost">刷新</button>
+          </div>
+          <div id="uploadGrid" class="upload-grid"></div>
+        </aside>
+      </main>
+    </div>
+
+    <div id="busyOverlay" class="busy-overlay hidden">
+      <div class="busy-box">
+        <div class="spinner"></div>
+        <strong>正在调用图像 API</strong>
+        <span>生成通常需要几十秒到数分钟</span>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <dialog id="settingsDialog" class="settings-dialog">
+      <form method="dialog" class="settings-card">
+        <div class="settings-head">
+          <div>
+            <h2>API 配置</h2>
+            <p>保存后立即生效</p>
+          </div>
+          <button id="closeSettingsBtn" class="button ghost" value="cancel">关闭</button>
+        </div>
+
+        <div class="settings-grid">
+          <label class="field">
+            <span>Profile</span>
+            <select id="settingsProfileSelect" class="select"></select>
+          </label>
+          <label class="field">
+            <span>名称</span>
+            <input id="profileNameInput" class="input" />
+          </label>
+          <label class="field wide">
+            <span>Base URL</span>
+            <input id="baseUrlInput" class="input" />
+          </label>
+          <label class="field wide">
+            <span>API Key</span>
+            <input id="apiKeyInput" class="input" type="password" autocomplete="off" placeholder="留空则保留已保存的 key" />
+          </label>
+          <label class="field">
+            <span>模型</span>
+            <input id="modelInput" class="input" value="gpt-image-2" />
+          </label>
+        </div>
+
+        <div id="configTestResult" class="config-test">未测试</div>
+
+        <div class="settings-actions">
+          <button id="addProfileBtn" class="button secondary" type="button">新增 Profile</button>
+          <button id="deleteProfileBtn" class="button danger" type="button">删除</button>
+          <span class="spacer"></span>
+          <button id="testConfigBtn" class="button secondary" type="button">测试当前配置</button>
+          <button id="saveConfigBtn" class="button primary" type="button">保存并切换</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

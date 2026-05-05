@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local configuration and secrets
+config/config.json
+!config/config.example.json
+
+# Runtime data
+data/*
+!data/.gitkeep
+!data/uploads/
+data/uploads/*
+!data/uploads/.gitkeep
+!data/outputs/
+data/outputs/*
+!data/outputs/.gitkeep
+
+# Logs
+*.log
+server.out.log
+server.err.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
