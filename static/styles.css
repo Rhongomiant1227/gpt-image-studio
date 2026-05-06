@@ -442,6 +442,10 @@ p {
   color: var(--soft);
   font-size: 12px;
   text-align: right;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .progress-track {
@@ -685,8 +689,16 @@ p {
   color: var(--danger);
 }
 
+.config-test.pending {
+  color: var(--warn);
+}
+
 .spacer {
   flex: 1;
+}
+
+.settings-actions {
+  flex-wrap: wrap;
 }
 
 @media (max-width: 1180px) {

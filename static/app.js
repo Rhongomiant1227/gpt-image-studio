@@ -8,7 +8,11 @@ const state = {
   activeHistoryId: null,
   pollTimer: null,
   editingProfileName: null,
+  draftProfile: null,
+  profileFormOrigin: null,
 };
+
+const DRAFT_PROFILE_ID = "__draft_profile__";
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -53,8 +57,10 @@ const els = {
   configTestResult: $("#configTestResult"),
   addProfileBtn: $("#addProfileBtn"),
   deleteProfileBtn: $("#deleteProfileBtn"),
+  discardProfileBtn: $("#discardProfileBtn"),
   testConfigBtn: $("#testConfigBtn"),
   saveConfigBtn: $("#saveConfigBtn"),
+  saveAndSwitchConfigBtn: $("#saveAndSwitchConfigBtn"),
 };
 
 function showToast(message, type = "info") {
@@ -113,15 +119,75 @@ function statusText(item) {
   const failed = progress.failed || item.failed_count || 0;
   const total = progress.total || item.count || 0;
   const suffix = total ? `${done}/${total}` : `${done}`;
-  if (item.status === "running") return failed ? `运行中 ${suffix} · 失败 ${failed}` : `运行中 ${suffix}`;
-  if (item.status === "queued") return `排队中 ${suffix}`;
-  if (item.status === "canceling") return `取消中 ${suffix}`;
-  if (item.status === "completed") return `完成 ${suffix}`;
-  if (item.status === "partial") return `部分完成 ${suffix} · 失败 ${failed}`;
-  if (item.status === "canceled") return `已取消 ${suffix}`;
-  if (item.status === "interrupted") return `已中断 ${suffix}`;
-  if (item.status === "failed") return `失败 ${suffix}`;
-  return item.status || "未知状态";
+  const summary = compactStatusSummary(item);
+  let text = item.status || "unknown";
+  if (item.status === "running") text = failed ? `运行中 ${suffix} · 失败 ${failed}` : `运行中 ${suffix}`;
+  else if (item.status === "queued") text = `排队中 ${suffix}`;
+  else if (item.status === "canceling") text = `取消中 ${suffix}`;
+  else if (item.status === "completed") text = `完成 ${suffix}`;
+  else if (item.status === "partial") text = `部分完成 ${suffix} · 失败 ${failed}`;
+  else if (item.status === "canceled") text = `已取消 ${suffix}`;
+  else if (item.status === "interrupted") text = `已中断 ${suffix}`;
+  else if (item.status === "failed") text = `失败 ${suffix}`;
+  return summary ? `${text} · ${summary}` : text;
+}
+
+function firstErrorLine(item) {
+  const first = item?.errors?.find?.((entry) => entry?.trim()) || item?.error?.split?.("\n")?.find?.((entry) => entry?.trim()) || "";
+  return first.replace(/^#\d+:\s*/, "").trim();
+}
+
+function friendlyErrorText(message) {
+  const text = (message || "").trim();
+  const lower = text.toLowerCase();
+  if (!text) return "";
+  if (lower.includes("getaddrinfo failed")) {
+    return "无法连接到服务地址：DNS 解析失败，请检查当前 Profile 的 Base URL。";
+  }
+  if (lower.includes("invalid api key") || lower.includes('\"code\":\"invalid_api_key\"')) {
+    return "API Key 无效，请检查当前 Profile 的密钥。";
+  }
+  if (lower.includes("concurrency limit exceeded")) {
+    return "并发已满（429）：当前同时运行的任务太多，请减少并发或稍后重试。";
+  }
+  if (lower.includes("rate limit") && lower.includes("429")) {
+    return "请求被限流（429）：请稍后重试，或减少同时运行的任务数量。";
+  }
+  if (lower.includes("content safety service is temporarily unavailable")) {
+    return "服务商内容安全服务暂时不可用（503），请稍后重试。";
+  }
+  if (lower.includes("image api returned no image payloads")) {
+    return "接口没有返回图片数据。通常是服务商兼容性问题或上游异常。";
+  }
+  if (lower.includes("image api error 502")) {
+    return "服务商上游服务异常（502），请稍后重试。";
+  }
+  if (lower.includes("image api error 503")) {
+    return "服务商暂时不可用（503），请稍后重试。";
+  }
+  if (lower.includes("image api error 504") || lower.includes("timed out") || lower.includes("timeout")) {
+    return "请求超时，请稍后重试。";
+  }
+  if (lower.includes("unable to connect to the remote server") || lower.includes("all connection attempts failed")) {
+    return "无法连接到服务，请检查网络、代理或 Base URL。";
+  }
+  return text;
+}
+
+function jobErrorSummary(item) {
+  return friendlyErrorText(firstErrorLine(item));
+}
+
+function fallbackSummary(item) {
+  const request = item?.request || {};
+  if (!request?.fallback_used || !request?.last_profile) return "";
+  return `已切换 ${request.last_profile}`;
+}
+
+function compactStatusSummary(item) {
+  const error = jobErrorSummary(item);
+  if (error) return error;
+  return fallbackSummary(item);
 }
 
 function maybeStartPolling() {
@@ -137,6 +203,86 @@ function maybeStartPolling() {
 
 function activeProfile() {
   return state.config?.profiles?.find((item) => item.name === state.config.active_profile);
+}
+
+function normalizeProfileForForm(profile = {}) {
+  return {
+    name: profile.name || "",
+    base_url: (profile.base_url || "").replace(/\/$/, ""),
+    model: profile.model || "gpt-image-2",
+  };
+}
+
+function currentSettingsSelection() {
+  if (state.draftProfile) return DRAFT_PROFILE_ID;
+  return state.editingProfileName || state.config?.active_profile || "";
+}
+
+function formProfileSnapshot() {
+  return {
+    name: els.profileNameInput.value.trim(),
+    base_url: els.baseUrlInput.value.trim().replace(/\/$/, ""),
+    model: els.modelInput.value.trim() || "gpt-image-2",
+    api_key: els.apiKeyInput.value.trim(),
+  };
+}
+
+function hasUnsavedProfileChanges() {
+  const original = state.profileFormOrigin || normalizeProfileForForm();
+  const current = formProfileSnapshot();
+  return (
+    current.name !== original.name
+    || current.base_url !== original.base_url
+    || current.model !== original.model
+    || Boolean(current.api_key)
+  );
+}
+
+function draftProfileLabel() {
+  const name = state.draftProfile?.name?.trim();
+  return name ? `新 Profile: ${name}` : "新 Profile";
+}
+
+function syncDraftProfileState() {
+  if (!state.draftProfile) return;
+  const current = formProfileSnapshot();
+  state.draftProfile = {
+    ...state.draftProfile,
+    name: current.name,
+    base_url: current.base_url,
+    model: current.model,
+  };
+  const option = els.settingsProfileSelect.querySelector(`option[value="${DRAFT_PROFILE_ID}"]`);
+  if (option) option.textContent = draftProfileLabel();
+}
+
+function refreshConfigActions() {
+  const selection = currentSettingsSelection();
+  const dirty = hasUnsavedProfileChanges();
+  const required = Boolean(els.profileNameInput.value.trim() && els.baseUrlInput.value.trim());
+  els.testConfigBtn.disabled = !els.baseUrlInput.value.trim();
+  els.saveConfigBtn.disabled = !required || !dirty;
+  els.saveAndSwitchConfigBtn.disabled = !required || !dirty;
+  els.discardProfileBtn.disabled = selection !== DRAFT_PROFILE_ID && !dirty;
+  if (selection === DRAFT_PROFILE_ID) {
+    els.deleteProfileBtn.disabled = false;
+    els.deleteProfileBtn.textContent = "放弃草稿";
+  } else {
+    els.deleteProfileBtn.disabled = (state.config?.profiles || []).length <= 1;
+    els.deleteProfileBtn.textContent = "删除";
+  }
+}
+
+function confirmDiscardProfileChanges() {
+  if (!hasUnsavedProfileChanges()) return true;
+  return window.confirm("当前 Profile 有未保存修改，确定放弃吗？");
+}
+
+function validateProfileBeforeSave(profile) {
+  const lowered = (profile.base_url || "").toLowerCase();
+  if (/\bexample\.(test|com|org|net)\b/.test(lowered)) {
+    throw new Error("Base URL 仍然是占位地址，请换成真实可用的服务地址。");
+  }
 }
 
 async function loadConfig() {
@@ -188,7 +334,7 @@ async function loadUploads() {
 function renderProfiles(settingsSelection = null) {
   const profiles = state.config?.profiles || [];
   const active = state.config?.active_profile;
-  const settingsActive = settingsSelection || state.editingProfileName || active;
+  const settingsActive = settingsSelection || currentSettingsSelection() || active;
   els.profileSelect.innerHTML = "";
   els.settingsProfileSelect.innerHTML = "";
   for (const profile of profiles) {
@@ -204,20 +350,40 @@ function renderProfiles(settingsSelection = null) {
     if (profile.name === settingsActive) settingsOption.selected = true;
     els.settingsProfileSelect.append(settingsOption);
   }
-  const selected = profiles.find((item) => item.name === settingsActive) || activeProfile();
+  if (state.draftProfile) {
+    const draftOption = document.createElement("option");
+    draftOption.value = DRAFT_PROFILE_ID;
+    draftOption.textContent = draftProfileLabel();
+    if (settingsActive === DRAFT_PROFILE_ID) draftOption.selected = true;
+    els.settingsProfileSelect.append(draftOption);
+  }
+  const selected = settingsActive === DRAFT_PROFILE_ID
+    ? state.draftProfile
+    : profiles.find((item) => item.name === settingsActive) || activeProfile();
   fillSettingsForm(selected);
 }
 
 function fillSettingsForm(profile) {
   if (!profile) return;
-  state.editingProfileName = profile.name || null;
-  els.profileNameInput.value = profile.name || "";
-  els.baseUrlInput.value = profile.base_url || "";
+  const normalized = normalizeProfileForForm(profile);
+  state.editingProfileName = profile.__draft ? DRAFT_PROFILE_ID : profile.name || null;
+  state.profileFormOrigin = normalized;
+  els.profileNameInput.value = normalized.name;
+  els.baseUrlInput.value = normalized.base_url;
   els.apiKeyInput.value = "";
   els.apiKeyInput.placeholder = profile.has_api_key ? "已保存，留空则保留" : "粘贴 API key";
-  els.modelInput.value = profile.model || "gpt-image-2";
-  els.configTestResult.textContent = profile.has_api_key ? "已保存 API key" : "未配置 API key";
-  els.configTestResult.className = profile.has_api_key ? "config-test ok" : "config-test fail";
+  els.modelInput.value = normalized.model;
+  if (profile.__draft) {
+    els.configTestResult.textContent = "新 Profile 尚未保存";
+    els.configTestResult.className = "config-test pending";
+  } else if (profile.has_api_key) {
+    els.configTestResult.textContent = "已保存 API key";
+    els.configTestResult.className = "config-test ok";
+  } else {
+    els.configTestResult.textContent = "未配置 API key";
+    els.configTestResult.className = "config-test";
+  }
+  refreshConfigActions();
 }
 
 function currentSize() {
@@ -265,6 +431,9 @@ function renderHistory() {
     card.querySelector(".job-status").textContent = item.status || "";
     card.querySelector(".job-status-text").textContent = statusText(item);
     card.querySelector(".prompt-line").textContent = item.prompt;
+    const statusLine = card.querySelector(".job-status-text");
+    const verboseMessage = item.error || (item.errors || []).join("\n");
+    if (verboseMessage) statusLine.title = verboseMessage;
     const thumbs = card.querySelector(".thumb-row");
     for (const image of outputs.slice(0, 4)) {
       const img = document.createElement("img");
@@ -359,7 +528,10 @@ function renderResults(outputs = state.outputs, record = null) {
   if (!state.outputs.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = record && isActiveJob(record) ? "任务运行中，单张完成后会出现在这里" : "生成结果会出现在这里";
+    const errorSummary = record ? compactStatusSummary(record) : "";
+    empty.textContent = record && isActiveJob(record)
+      ? "任务运行中，单张完成后会出现在这里"
+      : (errorSummary || "生成结果会出现在这里");
     els.resultGrid.append(empty);
     els.resultMeta.textContent = record ? statusText(record) : "等待生成";
     return;
@@ -521,52 +693,83 @@ async function deleteUploadImage(item) {
 }
 
 function profileFromForm() {
+  const previousName = state.editingProfileName === DRAFT_PROFILE_ID
+    ? null
+    : state.editingProfileName || els.settingsProfileSelect.value;
   const profile = {
     name: els.profileNameInput.value.trim(),
     base_url: els.baseUrlInput.value.trim().replace(/\/$/, ""),
     model: els.modelInput.value.trim() || "gpt-image-2",
-    previous_name: state.editingProfileName || els.settingsProfileSelect.value,
   };
+  if (previousName) profile.previous_name = previousName;
   const key = els.apiKeyInput.value.trim();
   if (key) profile.api_key = key;
   return profile;
 }
 
-async function saveConfigFromForm() {
+function buildProfilesPayload(profile) {
+  const previousName = state.editingProfileName === DRAFT_PROFILE_ID
+    ? null
+    : state.editingProfileName || els.settingsProfileSelect.value;
+  if (profile.name !== previousName && (state.config?.profiles || []).some((item) => item.name === profile.name)) {
+    throw new Error(`Profile 已存在：${profile.name}`);
+  }
+  const map = new Map((state.config.profiles || []).map((item) => [item.name, item]));
+  if (previousName && previousName !== profile.name) map.delete(previousName);
+  map.set(profile.name, profile);
+  return {
+    previousName,
+    profiles: Array.from(map.values()).map((item) => ({
+      name: item.name,
+      base_url: item.base_url,
+      model: item.model || "gpt-image-2",
+      ...(item.previous_name ? { previous_name: item.previous_name } : {}),
+      ...(item.api_key ? { api_key: item.api_key } : {}),
+    })),
+  };
+}
+
+async function persistProfile({ activate }) {
   const profile = profileFromForm();
   if (!profile.name || !profile.base_url) {
     showToast("Profile 名称和 Base URL 不能为空", "fail");
     return;
   }
-  const map = new Map((state.config.profiles || []).map((item) => [item.name, item]));
-  const oldName = els.settingsProfileSelect.value;
-  if (oldName && oldName !== profile.name) map.delete(oldName);
-  map.set(profile.name, profile);
-  const profiles = Array.from(map.values()).map((item) => ({
-    name: item.name,
-    base_url: item.base_url,
-    model: item.model || "gpt-image-2",
-    ...(item.previous_name ? { previous_name: item.previous_name } : {}),
-    ...(item.api_key ? { api_key: item.api_key } : {}),
-  }));
   try {
+    validateProfileBeforeSave(profile);
+    const oldActive = state.config.active_profile;
+    const { previousName, profiles } = buildProfilesPayload(profile);
+    const nextActive = activate
+      ? profile.name
+      : (oldActive === previousName ? profile.name : oldActive);
     state.config = await api("/api/config", {
       method: "POST",
-      body: JSON.stringify({ active_profile: profile.name, profiles }),
+      body: JSON.stringify({ active_profile: nextActive, profiles }),
     });
+    state.draftProfile = null;
     state.editingProfileName = profile.name;
     renderProfiles(profile.name);
-    await loadStatus();
-    showToast("配置已保存");
+    if (oldActive === previousName || oldActive === profile.name || oldActive !== state.config.active_profile) {
+      await loadStatus();
+    }
+    showToast(activate ? "配置已保存并切换" : "配置已保存");
   } catch (error) {
     showToast(error.message, "fail");
   }
 }
 
+async function saveConfigFromForm() {
+  await persistProfile({ activate: false });
+}
+
+async function saveAndSwitchConfigFromForm() {
+  await persistProfile({ activate: true });
+}
+
 async function testConfigFromForm() {
   const profile = profileFromForm();
   els.configTestResult.textContent = "测试中";
-  els.configTestResult.className = "config-test";
+  els.configTestResult.className = "config-test pending";
   try {
     const result = await api("/api/config/test", {
       method: "POST",
@@ -578,7 +781,8 @@ async function testConfigFromForm() {
     }
     const checked = (result.checked || []).map((item) => item.base_url).join(" → ");
     els.configTestResult.textContent = `${found} · ${result.resolved_base_url || result.base_url || profile.base_url}${checked ? ` · 已检查 ${checked}` : ""}`;
-    els.configTestResult.className = result.ok ? "config-test ok" : "config-test fail";
+    els.configTestResult.className = result.model_found ? "config-test ok" : (result.ok ? "config-test pending" : "config-test fail");
+    refreshConfigActions();
   } catch (error) {
     els.configTestResult.textContent = error.message;
     els.configTestResult.className = "config-test fail";
@@ -586,26 +790,61 @@ async function testConfigFromForm() {
 }
 
 function addProfile() {
-  const name = `profile-${Date.now().toString().slice(-5)}`;
-  const profile = {
-    name,
+  if (!confirmDiscardProfileChanges()) return;
+  state.draftProfile = {
+    __draft: true,
+    name: "",
     base_url: "",
     model: "gpt-image-2",
     has_api_key: false,
   };
-  state.config.profiles.push(profile);
-  renderProfiles(name);
-  els.settingsProfileSelect.value = name;
-  fillSettingsForm(profile);
+  renderProfiles(DRAFT_PROFILE_ID);
+  els.profileNameInput.focus();
+  showToast("已创建 Profile 草稿");
+}
+
+function discardProfileEdits() {
+  const wasDraft = state.editingProfileName === DRAFT_PROFILE_ID;
+  if (!confirmDiscardProfileChanges()) return;
+  if (wasDraft) {
+    state.draftProfile = null;
+    renderProfiles(state.config?.active_profile);
+  } else {
+    renderProfiles(state.editingProfileName || state.config?.active_profile);
+  }
+  showToast("已放弃未保存修改");
+}
+
+function closeSettingsDialog() {
+  const wasDraft = state.editingProfileName === DRAFT_PROFILE_ID;
+  if (!confirmDiscardProfileChanges()) return;
+  if (wasDraft) {
+    state.draftProfile = null;
+    renderProfiles(state.config?.active_profile);
+  } else {
+    renderProfiles(state.editingProfileName || state.config?.active_profile);
+  }
+  els.settingsDialog.close();
 }
 
 async function deleteCurrentProfile() {
+  const selection = currentSettingsSelection();
+  if (selection === DRAFT_PROFILE_ID) {
+    if (!confirmDiscardProfileChanges()) return;
+    state.draftProfile = null;
+    renderProfiles(state.config?.active_profile);
+    showToast("已放弃未保存 Profile");
+    return;
+  }
   if ((state.config.profiles || []).length <= 1) {
     showToast("至少保留一个 Profile", "fail");
     return;
   }
   const name = els.settingsProfileSelect.value;
-  if (!window.confirm(`确认删除 Profile「${name}」？`)) return;
+  const message = hasUnsavedProfileChanges()
+    ? `确认删除 Profile「${name}」？未保存的修改也会一起丢弃。`
+    : `确认删除 Profile「${name}」？`;
+  if (!window.confirm(message)) return;
   const remaining = state.config.profiles.filter((item) => item.name !== name);
   const active = state.config.active_profile === name ? remaining[0].name : state.config.active_profile;
   try {
@@ -621,6 +860,7 @@ async function deleteCurrentProfile() {
       }),
     });
     state.editingProfileName = active;
+    state.draftProfile = null;
     renderProfiles(active);
     await loadStatus();
     showToast("Profile 已删除");
@@ -637,30 +877,67 @@ function bindEvents() {
   els.sizeSelect.addEventListener("change", () => {
     els.customSizeField.classList.toggle("visible", els.sizeSelect.value === "custom");
   });
+  for (const input of [els.profileNameInput, els.baseUrlInput, els.apiKeyInput, els.modelInput]) {
+    input.addEventListener("input", () => {
+      syncDraftProfileState();
+      refreshConfigActions();
+    });
+  }
   els.profileSelect.addEventListener("change", async () => {
+    const target = els.profileSelect.value;
+    const previous = state.config.active_profile;
+    if (els.settingsDialog.open && !confirmDiscardProfileChanges()) {
+      els.profileSelect.value = previous;
+      return;
+    }
+    if (els.settingsDialog.open && state.editingProfileName === DRAFT_PROFILE_ID) {
+      state.draftProfile = null;
+    }
     try {
       state.config = await api("/api/config/active", {
         method: "POST",
-        body: JSON.stringify({ name: els.profileSelect.value }),
+        body: JSON.stringify({ name: target }),
       });
-      state.editingProfileName = els.profileSelect.value;
-      renderProfiles(els.profileSelect.value);
+      state.editingProfileName = target;
+      renderProfiles(target);
       await loadStatus();
       showToast("Profile 已切换");
     } catch (error) {
       showToast(error.message, "fail");
     }
   });
-  els.settingsBtn.addEventListener("click", () => els.settingsDialog.showModal());
+  els.settingsBtn.addEventListener("click", () => {
+    renderProfiles(currentSettingsSelection() || state.config?.active_profile);
+    els.settingsDialog.showModal();
+  });
   els.settingsProfileSelect.addEventListener("change", () => {
-    const profile = state.config.profiles.find((item) => item.name === els.settingsProfileSelect.value);
+    const target = els.settingsProfileSelect.value;
+    const current = currentSettingsSelection();
+    if (target === current) return;
+    if (!confirmDiscardProfileChanges()) {
+      els.settingsProfileSelect.value = current;
+      return;
+    }
+    if (current === DRAFT_PROFILE_ID) state.draftProfile = null;
+    const profile = target === DRAFT_PROFILE_ID
+      ? state.draftProfile
+      : state.config.profiles.find((item) => item.name === target);
     fillSettingsForm(profile);
   });
   els.addProfileBtn.addEventListener("click", addProfile);
   els.deleteProfileBtn.addEventListener("click", deleteCurrentProfile);
+  els.discardProfileBtn.addEventListener("click", discardProfileEdits);
   els.saveConfigBtn.addEventListener("click", saveConfigFromForm);
+  els.saveAndSwitchConfigBtn.addEventListener("click", saveAndSwitchConfigFromForm);
   els.testConfigBtn.addEventListener("click", testConfigFromForm);
-  els.closeSettingsBtn.addEventListener("click", () => els.settingsDialog.close());
+  els.closeSettingsBtn.addEventListener("click", (event) => {
+    event.preventDefault();
+    closeSettingsDialog();
+  });
+  els.settingsDialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeSettingsDialog();
+  });
   els.generateBtn.addEventListener("click", generate);
   els.clearBtn.addEventListener("click", () => {
     els.promptInput.value = "";

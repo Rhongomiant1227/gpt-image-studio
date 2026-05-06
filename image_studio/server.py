@@ -690,6 +690,146 @@ def request_preview(req: GenerateRequest, mode: str, image_paths: list[Path]) ->
     return preview
 
 
+def configured_profiles(preferred_name: str | None = None) -> list[dict[str, Any]]:
+    config = load_config()
+    raw_profiles = config.get("profiles", [])
+    preferred = preferred_name or config.get("active_profile")
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    ordered_names = [preferred] if preferred else []
+    ordered_names.extend(profile.get("name") for profile in raw_profiles if profile.get("name") != preferred)
+    for name in ordered_names:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        for profile in raw_profiles:
+            if profile.get("name") != name:
+                continue
+            resolved = dict(profile)
+            resolved["base_url"] = normalize_base_url(str(resolved.get("base_url", "")))
+            resolved["model"] = normalize_model_name(resolved.get("model"))
+            if resolved.get("base_url") and (resolved.get("api_key") or os.getenv("OPENAI_API_KEY")):
+                selected.append(resolved)
+            break
+    return selected
+
+
+def fallback_profiles(primary: dict[str, Any]) -> list[dict[str, Any]]:
+    primary_name = primary.get("name")
+    requested_model = normalize_model_name(primary.get("model"))
+    alternates: list[dict[str, Any]] = []
+    for profile in configured_profiles(primary_name):
+        if profile.get("name") == primary_name:
+            continue
+        candidate_model = normalize_model_name(profile.get("model"))
+        if requested_model and candidate_model != requested_model:
+            continue
+        alternates.append(profile)
+    return alternates
+
+
+def should_retry_with_fallback(exc: Exception) -> bool:
+    message = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+    lower = (message or "").lower()
+    if isinstance(exc, HTTPException) and exc.status_code < 500:
+        return False
+    hard_failures = (
+        "invalid api key",
+        '"code":"invalid_api_key"',
+        "api key is not configured",
+        "profile not found",
+        "edit mode needs at least one imported image",
+        "quality must be",
+        "output format must be",
+        "size must be",
+        "background for gpt-image-2",
+        "invalid image id",
+        "image not found",
+    )
+    if any(token in lower for token in hard_failures):
+        return False
+    retryable_tokens = (
+        "image api error 429",
+        "rate limit",
+        "concurrency limit exceeded",
+        "image api error 502",
+        "image api error 503",
+        "image api error 504",
+        "timed out",
+        "timeout",
+        "getaddrinfo failed",
+        "all connection attempts failed",
+        "unable to connect to the remote server",
+        "connection refused",
+        "connection reset",
+        "temporarily unavailable",
+        "no image payloads",
+    )
+    return any(token in lower for token in retryable_tokens)
+
+
+def provider_attempt_error(exc: Exception) -> str:
+    if isinstance(exc, HTTPException):
+        return str(exc.detail)
+    return str(exc)
+
+
+async def call_with_fallback(
+    req: GenerateRequest,
+    profile: dict[str, Any],
+    image_paths: list[Path],
+    mode: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    attempts: list[dict[str, Any]] = []
+    providers = [profile, *fallback_profiles(profile)]
+    last_exc: Exception | None = None
+    for index, candidate in enumerate(providers):
+        candidate_name = str(candidate.get("name") or "")
+        candidate_base_url = api_base_url(candidate)
+        try:
+            if mode == "edit":
+                output, payload = await call_edit_api_once(req, candidate, image_paths)
+            else:
+                output, payload = await call_generation_api_once(req, candidate)
+            meta = {
+                "profile": candidate_name,
+                "base_url": candidate_base_url,
+                "fallback_used": index > 0,
+                "attempts": attempts + [
+                    {
+                        "profile": candidate_name,
+                        "base_url": candidate_base_url,
+                        "status": "ok",
+                    }
+                ],
+            }
+            return output, payload, meta
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            attempts.append(
+                {
+                    "profile": candidate_name,
+                    "base_url": candidate_base_url,
+                    "status": "error",
+                    "error": provider_attempt_error(exc),
+                }
+            )
+            if not should_retry_with_fallback(exc) or index >= len(providers) - 1:
+                break
+    if last_exc is None:
+        raise HTTPException(status_code=500, detail="No available profile for image generation.")
+    attempt_summary = " -> ".join(
+        f"{item['profile'] or item['base_url']}: {item.get('error', item.get('status', 'error'))}"
+        for item in attempts
+    )
+    if should_retry_with_fallback(last_exc) and len(attempts) > 1:
+        message = f"{provider_attempt_error(last_exc)} | tried: {attempt_summary}"
+        raise HTTPException(status_code=502, detail=message)
+    raise last_exc
+
+
 async def call_generation_api_once(
     req: GenerateRequest,
     profile: dict[str, Any],
@@ -759,9 +899,34 @@ async def call_edit_api_once(
 
 
 def exception_message(exc: Exception) -> str:
+    def humanize_error_message(message: str) -> str:
+        text = (message or "").strip()
+        lower = text.lower()
+        if "getaddrinfo failed" in lower:
+            return "无法连接到服务地址（DNS 解析失败）。请检查当前 Profile 的 Base URL 是否写错。"
+        if "invalid api key" in lower or '"code":"invalid_api_key"' in lower:
+            return "API Key 无效。请检查当前 Profile 的密钥。"
+        if "concurrency limit exceeded" in lower:
+            return "并发已满（429）。当前账号同时运行的图片任务太多，请减少并发任务或稍后重试。"
+        if "rate limit" in lower and "429" in lower:
+            return "请求被限流（429）。请稍后重试，或减少同时运行的任务数量。"
+        if "content safety service is temporarily unavailable" in lower:
+            return "服务商内容安全服务暂时不可用（503）。这是上游服务问题，请稍后重试。"
+        if "image api returned no image payloads" in lower:
+            return "接口返回成功，但没有图片数据。通常是服务商兼容性问题或上游异常。"
+        if "image api error 502" in lower:
+            return "服务商上游服务异常（502）。请稍后重试。"
+        if "image api error 503" in lower:
+            return "服务商暂时不可用（503）。请稍后重试。"
+        if "image api error 504" in lower or "timed out" in lower or "timeout" in lower:
+            return "请求超时。服务响应过慢，请稍后重试。"
+        if "unable to connect to the remote server" in lower or "all connection attempts failed" in lower:
+            return "无法连接到服务。请检查网络、代理或 Base URL。"
+        return text
+
     if isinstance(exc, HTTPException):
-        return str(exc.detail)
-    return str(exc)
+        return humanize_error_message(str(exc.detail))
+    return humanize_error_message(str(exc))
 
 
 async def run_generation_job(
@@ -778,23 +943,28 @@ async def run_generation_job(
     failed = 0
     final_status = "completed"
     final_error: str | None = None
+    preview = request_preview(req, mode, image_paths)
     try:
         for index in range(req.count):
             if cancel_event.is_set():
                 final_status = "canceled"
                 break
             try:
-                if mode == "edit":
-                    output, payload = await call_edit_api_once(req, profile, image_paths)
-                else:
-                    output, payload = await call_generation_api_once(req, profile)
+                output, payload, provider_meta = await call_with_fallback(req, profile, image_paths, mode)
                 outputs.append(output)
                 completed += 1
                 update_history(
                     job_id,
                     status="running" if completed < req.count else "completed",
                     outputs=outputs,
-                    request={**request_preview(req, mode, image_paths), "last_payload": payload},
+                    request={
+                        **preview,
+                        "last_payload": payload,
+                        "last_profile": provider_meta["profile"],
+                        "last_base_url": provider_meta["base_url"],
+                        "fallback_used": provider_meta["fallback_used"],
+                        "attempts": provider_meta["attempts"],
+                    },
                     completed_count=completed,
                     failed_count=failed,
                     errors=errors,
@@ -849,6 +1019,15 @@ def prepare_job(req: GenerateRequest) -> tuple[dict[str, Any], dict[str, Any], l
     mode = "edit" if (req.mode == "edit" or (req.mode == "auto" and image_paths)) else "generate"
     job_id = uuid.uuid4().hex
     created_at = utc_stamp()
+    preview = request_preview(req, mode, image_paths)
+    preview["fallback_candidates"] = [
+        {
+            "profile": item.get("name", ""),
+            "base_url": api_base_url(item),
+            "model": item.get("model") or "gpt-image-2",
+        }
+        for item in [profile, *fallback_profiles(profile)]
+    ]
     record = {
         "id": job_id,
         "created_at": created_at,
@@ -869,7 +1048,7 @@ def prepare_job(req: GenerateRequest) -> tuple[dict[str, Any], dict[str, Any], l
         "completed_count": 0,
         "failed_count": 0,
         "errors": [],
-        "request": request_preview(req, mode, image_paths),
+        "request": preview,
     }
     return record, profile, image_paths, mode
 
@@ -935,9 +1114,22 @@ async def write_config(config_in: ConfigIn) -> dict[str, Any]:
         }
         if incoming.api_key:
             profile["api_key"] = incoming.api_key
-        check = await check_profile(profile)
-        if check.get("ok") and check.get("resolved_base_url"):
-            profile["base_url"] = str(check["resolved_base_url"])
+        old_base_url = normalize_base_url(old_profile.get("base_url"))
+        old_model = normalize_model_name(old_profile.get("model"))
+        should_check = (
+            incoming.api_key is not None
+            or old_base_url != profile["base_url"]
+            or old_model != profile["model"]
+        )
+        if should_check:
+            check = await check_profile(profile)
+            if not check.get("ok"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Profile check failed for {incoming.name}: {check.get('message', 'API check failed.')}",
+                )
+            if check.get("ok") and check.get("resolved_base_url"):
+                profile["base_url"] = str(check["resolved_base_url"])
         profiles.append(profile)
     if not any(p["name"] == config_in.active_profile for p in profiles):
         raise HTTPException(status_code=400, detail="Active profile must exist in profiles.")
